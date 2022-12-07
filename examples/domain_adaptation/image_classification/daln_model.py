@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
 from torch.optim import SGD
-from torch.optim.lr_scheduler import LambdaLR
+from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
 
@@ -76,10 +76,10 @@ def main(args: argparse.Namespace):
                                  pool_layer=pool_layer, finetune=not args.scratch).to(device)
 
     # define optimizer and lr scheduler
-    optimizer = SGD(classifier.get_parameters(),
+    optimizer = SGD(classifier.get_parameters(base_lr=args.lr),
                     args.lr, momentum=args.momentum, weight_decay=args.weight_decay, nesterov=True)
-    lr_scheduler = LambdaLR(optimizer, lambda x: args.lr * (1. + args.lr_gamma * float(x)) ** (-args.lr_decay))
-
+    # lr_scheduler = LambdaLR(optimizer, lambda x: args.lr * (1. + args.lr_gamma * float(x)) ** (-args.lr_decay))
+    lr_scheduler = CosineAnnealingLR(optimizer, T_max=2, eta_min=0)
     # instantiate NWD
     discrepancy = NuclearWassersteinDiscrepancy(classifier.head).to(device)
 
@@ -111,7 +111,7 @@ def main(args: argparse.Namespace):
     # start training
     best_acc1 = 0.
     for epoch in range(args.epochs):
-        print("lr:", lr_scheduler.get_last_lr()[0])
+        print("lr:", lr_scheduler.get_last_lr())
         # train for one epoch
         train(train_source_iter, train_target_iter, classifier, discrepancy, optimizer,
               lr_scheduler, epoch, args)
@@ -137,7 +137,7 @@ def main(args: argparse.Namespace):
 
 def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverDataIterator,
           model: ImageClassifier, domain_discrepancy, optimizer: SGD,
-          lr_scheduler: LambdaLR, epoch: int, args: argparse.Namespace):
+          lr_scheduler, epoch: int, args: argparse.Namespace):
     batch_time = AverageMeter('Time', ':5.2f')
     data_time = AverageMeter('Data', ':5.2f')
     losses = AverageMeter('Loss', ':6.2f')
@@ -242,7 +242,7 @@ if __name__ == '__main__':
     parser.add_argument('-b', '--batch-size', default=32, type=int,
                         metavar='N',
                         help='mini-batch size (default: 32)')
-    parser.add_argument('--lr', '--learning-rate', default=0.01, type=float,
+    parser.add_argument('--lr', '--learning-rate', default=5e-4, type=float,
                         metavar='LR', help='initial learning rate', dest='lr')
     parser.add_argument('--lr-gamma', default=0.001, type=float, help='parameter for lr scheduler')
     parser.add_argument('--lr-decay', default=0.75, type=float, help='parameter for lr scheduler')
