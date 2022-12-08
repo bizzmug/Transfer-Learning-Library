@@ -26,6 +26,7 @@ from tllib.utils.metric import accuracy
 from tllib.utils.meter import AverageMeter, ProgressMeter
 from tllib.utils.logger import CompleteLogger
 from tllib.utils.analysis import collect_feature, tsne, a_distance
+from daln.nwd import NuclearWassersteinDiscrepancy
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -44,7 +45,10 @@ class ImageClassifier(Classifier):
         f = self.pool_layer(self.backbone(x))
         f = self.bottleneck(f)
         predictions = self.head(f)
-        return predictions
+        if self.training:
+            return predictions, f
+        else:
+            return predictions
 
 
 def main(args: argparse.Namespace):
@@ -111,6 +115,9 @@ def main(args: argparse.Namespace):
                     nesterov=True)
     lr_scheduler = LambdaLR(optimizer, lambda x: args.lr * (1. + args.lr_gamma * float(x)) ** (-args.lr_decay))
 
+    # instantiate NWD
+    discrepancy = NuclearWassersteinDiscrepancy(classifier.head).to(device)
+
     # resume from the best checkpoint
     if args.phase != 'train':
         checkpoint = torch.load(logger.get_checkpoint_path('best'), map_location='cpu')
@@ -141,7 +148,7 @@ def main(args: argparse.Namespace):
     for epoch in range(args.epochs):
         print("lr:", lr_scheduler.get_last_lr())
         # train for one epoch
-        train(train_source_iter, train_target_iter, classifier, optimizer, lr_scheduler, epoch, args)
+        train(train_source_iter, train_target_iter, classifier, discrepancy, optimizer, lr_scheduler, epoch, args)
 
         # evaluate on validation set
         acc1 = utils.validate(val_loader, classifier, args, device)
@@ -163,7 +170,7 @@ def main(args: argparse.Namespace):
 
 
 def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverDataIterator,
-          model: ImageClassifier, optimizer: SGD, lr_scheduler: LambdaLR, epoch: int, args: argparse.Namespace):
+          model: ImageClassifier, domain_discrepancy, optimizer: SGD, lr_scheduler: LambdaLR, epoch: int, args: argparse.Namespace):
     batch_time = AverageMeter('Time', ':5.2f')
     data_time = AverageMeter('Data', ':5.2f')
     cls_losses = AverageMeter('Cls Loss', ':6.2f')
@@ -173,10 +180,12 @@ def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverData
     pseudo_label_ratios = AverageMeter('Pseudo Label Ratio', ':3.1f')
     pseudo_label_accs = AverageMeter('Pseudo Label Acc', ':3.1f')
 
+    discre = AverageMeter('Discrepancy Loss', ':6.2f')
+
     progress = ProgressMeter(
         args.iters_per_epoch,
         [batch_time, data_time, losses, cls_losses, self_training_losses, cls_accs, pseudo_label_accs,
-         pseudo_label_ratios],
+         pseudo_label_ratios, discre],
         prefix="Epoch: [{}]".format(epoch))
 
     self_training_criterion = ConfidenceBasedSelfTrainingLoss(args.threshold).to(device)
@@ -202,24 +211,35 @@ def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverData
 
         # compute output
         with torch.no_grad():
-            y_t = model(x_t)
+            y_t, _ = model(x_t)
 
-        # cross entropy loss
-        y_s = model(x_s)
+        # cross entropy loss and discrepancy loss
+        y_s, f_s = model(x_s)
+        _, f_t = model(x_t)
+
+        f = torch.cat([f_s, f_t], dim=0)
+
+        discrepancy_loss = -domain_discrepancy(f)
         cls_loss = F.cross_entropy(y_s, labels_s)
-        cls_loss.backward()
+        loss_total = cls_loss + 1. * discrepancy_loss
+
+        loss_total.backward()
+
+        # discrepancy loss
+
 
         # self-training loss
-        y_t_strong = model(x_t_strong)
+        y_t_strong, _ = model(x_t_strong)
         self_training_loss, mask, pseudo_labels = self_training_criterion(y_t_strong, y_t)
         self_training_loss = args.trade_off * self_training_loss
         self_training_loss.backward()
 
         # measure accuracy and record loss
-        loss = cls_loss + self_training_loss
+        loss = cls_loss + self_training_loss + discrepancy_loss
         losses.update(loss.item(), x_s.size(0))
         cls_losses.update(cls_loss.item(), x_s.size(0))
         self_training_losses.update(self_training_loss.item(), x_s.size(0))
+        discre.update(discrepancy_loss.item(), x_s.size(0))
 
         cls_acc = accuracy(y_s, labels_s)[0]
         cls_accs.update(cls_acc.item(), x_s.size(0))
